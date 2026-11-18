@@ -1,0 +1,12 @@
+[package]
+name = "kvroute-sim"
+description = "Discrete-event simulator for kvroute routing policies."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kvroute-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "kvroute-core"
+description = "Pure, deterministic KV-cache-aware routing logic."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

@@ -1,0 +1,15 @@
+[package]
+name = "kvroute-proxy"
+description = "KV-cache-aware routing proxy for LLM inference backends."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kvroute-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,7 @@
+/target
+benchmarks/results/*.csv
+benchmarks/results/*.parquet
+benchmarks/plots/*.png
+.venv/
+__pycache__/
+.DS_Store
