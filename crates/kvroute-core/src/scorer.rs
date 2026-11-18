@@ -1,7 +1,8 @@
-use std::cmp::Reverse;
+use std::cmp::{Ordering, Reverse};
 
 use serde::{Deserialize, Serialize};
 
+use crate::admission::AdmissionDecision;
 use crate::hash::{BlockHash, WorkerId};
 use crate::index::{CacheEvent, GlobalPrefixIndex};
 
@@ -68,31 +69,25 @@ impl Router {
         workers: &[WorkerMetrics],
         now_ms: u64,
     ) -> Option<RouteDecision> {
-        let n = workers.iter().map(|m| m.worker.0 + 1).max()?;
-        let matched = self.index.match_prefix(hashes, n, now_ms);
-        let ScoringWeights { alpha, beta, gamma } = self.weights;
-
-        workers
-            .iter()
-            .filter(|m| m.healthy)
-            .map(|m| {
-                let mb = matched[m.worker.0 as usize];
-                let score = alpha * mb as f64 - beta * m.queue_depth as f64 - gamma * m.kv_util();
-                (m, mb, score)
-            })
-            .max_by(|a, b| {
-                a.2.total_cmp(&b.2)
-                    .then(a.1.cmp(&b.1))
-                    .then(Reverse(a.0.queue_depth).cmp(&Reverse(b.0.queue_depth)))
-                    .then(Reverse(a.0.worker).cmp(&Reverse(b.0.worker)))
-            })
-            .map(|(m, mb, score)| RouteDecision {
-                worker: m.worker,
-                matched_blocks: mb,
-                total_blocks: hashes.len(),
-                score,
-            })
+        match self.route_with_admission(hashes, workers, now_ms, None) {
+            AdmissionDecision::Admit(d) => Some(d),
+            AdmissionDecision::Defer { .. } => None,
+        }
     }
+
+    pub(crate) fn score(&self, m: &WorkerMetrics, matched: usize) -> f64 {
+        let ScoringWeights { alpha, beta, gamma } = self.weights;
+        alpha * matched as f64 - beta * m.queue_depth as f64 - gamma * m.kv_util()
+    }
+}
+
+/// Total order over candidates: score, then matched blocks, then shorter
+/// queue, then lower id.
+pub(crate) fn rank(a: (&WorkerMetrics, usize, f64), b: (&WorkerMetrics, usize, f64)) -> Ordering {
+    a.2.total_cmp(&b.2)
+        .then(a.1.cmp(&b.1))
+        .then(Reverse(a.0.queue_depth).cmp(&Reverse(b.0.queue_depth)))
+        .then(Reverse(a.0.worker).cmp(&Reverse(b.0.worker)))
 }
 
 #[cfg(test)]

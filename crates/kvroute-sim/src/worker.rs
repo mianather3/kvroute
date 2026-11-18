@@ -28,54 +28,85 @@ impl Default for WorkerConfig {
     }
 }
 
-/// Exact LRU over block hashes. The `BTreeMap` keyed by access tick gives
-/// O(log n) touch/evict with fully deterministic ordering.
-#[derive(Debug, Clone)]
-pub struct LruCache {
-    cap: usize,
+#[derive(Debug, Clone, Copy)]
+struct Entry {
+    refs: u32,
     tick: u64,
-    stamp: HashMap<BlockHash, u64>,
-    order: BTreeMap<u64, BlockHash>,
 }
 
-impl LruCache {
-    pub fn new(cap: usize) -> Self {
-        Self {
-            cap,
-            tick: 0,
-            stamp: HashMap::new(),
-            order: BTreeMap::new(),
-        }
-    }
+/// Prefix block cache with vLLM-style pinning: blocks referenced by running
+/// requests are pinned; only unpinned blocks sit in the LRU and can be evicted.
+/// The `BTreeMap` keyed by release tick keeps eviction order deterministic.
+#[derive(Debug, Clone, Default)]
+pub struct BlockCache {
+    tick: u64,
+    entries: HashMap<BlockHash, Entry>,
+    lru: BTreeMap<u64, BlockHash>,
+}
 
+impl BlockCache {
     pub fn len(&self) -> usize {
-        self.stamp.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.stamp.is_empty()
+        self.entries.is_empty()
+    }
+
+    pub fn pinned(&self) -> usize {
+        self.entries.len() - self.lru.len()
     }
 
     pub fn contains(&self, h: BlockHash) -> bool {
-        self.stamp.contains_key(&h)
+        self.entries.contains_key(&h)
     }
 
-    /// Marks `h` most-recently-used, inserting it if absent.
-    /// Returns `(was_resident, evicted)`.
-    pub fn access(&mut self, h: BlockHash) -> (bool, Option<BlockHash>) {
-        self.tick += 1;
-        if let Some(old) = self.stamp.insert(h, self.tick) {
-            self.order.remove(&old);
-            self.order.insert(self.tick, h);
-            return (true, None);
+    fn is_pinned(&self, h: BlockHash) -> bool {
+        self.entries.get(&h).is_some_and(|e| e.refs > 0)
+    }
+
+    /// Resident hashes in sorted order (deterministic snapshot).
+    pub fn snapshot(&self) -> Vec<BlockHash> {
+        let mut v: Vec<_> = self.entries.keys().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Pins `h`, inserting it if absent. Returns whether it was resident.
+    pub fn acquire(&mut self, h: BlockHash) -> bool {
+        match self.entries.get_mut(&h) {
+            Some(e) => {
+                if e.refs == 0 {
+                    self.lru.remove(&e.tick);
+                }
+                e.refs += 1;
+                true
+            }
+            None => {
+                self.entries.insert(h, Entry { refs: 1, tick: 0 });
+                false
+            }
         }
-        self.order.insert(self.tick, h);
-        if self.stamp.len() <= self.cap {
-            return (false, None);
+    }
+
+    /// Unpins `h`; at zero refs it becomes the most-recently-used evictable block.
+    pub fn release(&mut self, h: BlockHash) {
+        let e = self
+            .entries
+            .get_mut(&h)
+            .expect("release of non-resident block");
+        e.refs -= 1;
+        if e.refs == 0 {
+            self.tick += 1;
+            e.tick = self.tick;
+            self.lru.insert(self.tick, h);
         }
-        let (_, victim) = self.order.pop_first().expect("non-empty");
-        self.stamp.remove(&victim);
-        (false, Some(victim))
+    }
+
+    pub fn evict_lru(&mut self) -> Option<BlockHash> {
+        let (_, h) = self.lru.pop_first()?;
+        self.entries.remove(&h);
+        Some(h)
     }
 }
 
@@ -90,23 +121,32 @@ pub struct Started {
     pub events: Vec<CacheEvent>,
 }
 
+/// One simulated vLLM worker: a FIFO queue feeding up to `max_batch_size`
+/// slots, gated by KV blocks. Running requests pin their prompt blocks plus
+/// private blocks (partial tail + decode); everything else is evictable cache.
 #[derive(Debug, Clone)]
 pub struct Worker {
     pub id: WorkerId,
     cfg: WorkerConfig,
-    cache: LruCache,
+    cache: BlockCache,
     running: usize,
+    private_blocks: usize,
     waiting: VecDeque<usize>,
-    outstanding: usize,
+    waiting_blocks: usize,
     in_flight_tokens: usize,
-    committed_blocks: usize,
     pub hit_blocks: u64,
     pub miss_blocks: u64,
     pub evictions: u64,
 }
 
+/// Blocks a request occupies for its whole lifetime.
 fn kv_blocks(r: &SimRequest) -> usize {
     (r.input_tokens + r.output_tokens).div_ceil(BLOCK_SIZE)
+}
+
+/// Blocks only this request can use: the partial prompt tail and decode output.
+fn private_blocks(r: &SimRequest) -> usize {
+    kv_blocks(r).saturating_sub(r.block_hashes.len())
 }
 
 fn ms_to_us(ms: f64) -> u64 {
@@ -119,77 +159,109 @@ impl Worker {
         Self {
             id,
             cfg,
-            cache: LruCache::new(cfg.kv_capacity_blocks),
+            cache: BlockCache::default(),
             running: 0,
+            private_blocks: 0,
             waiting: VecDeque::new(),
-            outstanding: 0,
+            waiting_blocks: 0,
             in_flight_tokens: 0,
-            committed_blocks: 0,
             hit_blocks: 0,
             miss_blocks: 0,
             evictions: 0,
         }
     }
 
-    /// `queue_depth` counts running plus waiting requests; KV usage is the
-    /// footprint those requests will need, not resident (reusable) cache.
+    fn pinned_blocks(&self) -> usize {
+        self.cache.pinned() + self.private_blocks
+    }
+
+    /// `queue_depth` is running + waiting. `kv_used_blocks` is committed KV:
+    /// blocks pinned by running requests plus the full footprint of queued
+    /// ones. Unpinned cache is reclaimable, so it is not counted.
     pub fn metrics(&self) -> WorkerMetrics {
         WorkerMetrics {
             worker: self.id,
-            queue_depth: self.outstanding,
+            queue_depth: self.running + self.waiting.len(),
             in_flight_tokens: self.in_flight_tokens,
-            kv_used_blocks: self.committed_blocks,
+            kv_used_blocks: self.pinned_blocks() + self.waiting_blocks,
             kv_capacity_blocks: self.cfg.kv_capacity_blocks,
             healthy: true,
         }
     }
 
-    pub fn cache(&self) -> &LruCache {
+    pub fn cache(&self) -> &BlockCache {
         &self.cache
     }
 
-    /// Accepts request `idx`; returns true if a batch slot is free and it
-    /// should start now, otherwise it is queued.
-    pub fn admit(&mut self, idx: usize, req: &SimRequest) -> bool {
-        self.outstanding += 1;
+    /// Queues request `idx`; call [`Worker::pop_startable`] to start what fits.
+    pub fn admit(&mut self, idx: usize, req: &SimRequest) {
+        self.waiting.push_back(idx);
+        self.waiting_blocks += kv_blocks(req);
         self.in_flight_tokens += req.input_tokens + req.output_tokens;
-        self.committed_blocks += kv_blocks(req);
-        if self.running < self.cfg.max_batch_size {
-            self.running += 1;
-            true
-        } else {
-            self.waiting.push_back(idx);
-            false
-        }
     }
 
-    /// Runs the cache lookup and computes service time for a request entering a slot.
+    /// Whether `req` can enter a slot now without exceeding KV capacity.
+    /// An idle worker always accepts, so oversized requests cannot deadlock.
+    fn fits(&self, req: &SimRequest) -> bool {
+        if self.running >= self.cfg.max_batch_size {
+            return false;
+        }
+        if self.running == 0 {
+            return true;
+        }
+        let newly_pinned = req
+            .block_hashes
+            .iter()
+            .filter(|&&h| !self.cache.is_pinned(h))
+            .count();
+        self.pinned_blocks() + newly_pinned + private_blocks(req) <= self.cfg.kv_capacity_blocks
+    }
+
+    /// Dequeues the head request if it fits (strict FIFO: no overtaking).
+    pub fn pop_startable(&mut self, reqs: &[SimRequest]) -> Option<usize> {
+        let &idx = self.waiting.front()?;
+        if !self.fits(&reqs[idx]) {
+            return None;
+        }
+        self.waiting.pop_front();
+        self.waiting_blocks -= kv_blocks(&reqs[idx]);
+        Some(idx)
+    }
+
+    /// Evicts unpinned blocks until usage fits capacity (or nothing is evictable).
+    fn reclaim(&mut self) -> Vec<BlockHash> {
+        let mut evicted = Vec::new();
+        while self.cache.len() + self.private_blocks > self.cfg.kv_capacity_blocks {
+            match self.cache.evict_lru() {
+                Some(h) => evicted.push(h),
+                None => break,
+            }
+        }
+        self.evictions += evicted.len() as u64;
+        evicted
+    }
+
+    /// Pins the request's blocks, evicts to make room, and computes service time.
     pub fn start(&mut self, req: &SimRequest, now_ms: u64) -> Started {
         let hashes = &req.block_hashes;
         let matched = hashes
             .iter()
             .take_while(|&&h| self.cache.contains(h))
             .count();
-
-        // Touch every block in order: hits refresh recency, misses get computed
-        // and inserted. Blocks past a gap are recomputed even if resident.
-        let mut inserted = Vec::new();
-        let mut evicted = Vec::new();
-        for &h in hashes {
-            let (hit, victim) = self.cache.access(h);
-            if !hit {
-                inserted.push(h);
-            }
-            evicted.extend(victim);
-        }
-        self.evictions += evicted.len() as u64;
         self.hit_blocks += matched as u64;
         self.miss_blocks += (hashes.len() - matched) as u64;
 
-        // Report net changes only, so a block inserted then evicted within this
-        // request never appears as both stored and removed.
-        evicted.retain(|h| !inserted.contains(h));
-        inserted.retain(|&h| self.cache.contains(h));
+        // Blocks past a gap are recomputed (prefill) but reuse resident storage.
+        let inserted: Vec<_> = hashes
+            .iter()
+            .copied()
+            .filter(|&h| !self.cache.acquire(h))
+            .collect();
+        self.running += 1;
+        self.private_blocks += private_blocks(req);
+        // Pinned blocks are never evicted, so `evicted` and `inserted` are disjoint.
+        let evicted = self.reclaim();
+
         let mut events = Vec::with_capacity(2);
         if !evicted.is_empty() {
             events.push(CacheEvent::BlockRemoved {
@@ -217,16 +289,24 @@ impl Worker {
         }
     }
 
-    /// Releases a finished request; returns the next queued request to start, if any.
-    pub fn finish(&mut self, req: &SimRequest) -> Option<usize> {
-        self.outstanding -= 1;
-        self.in_flight_tokens -= req.input_tokens + req.output_tokens;
-        self.committed_blocks -= kv_blocks(req);
-        let next = self.waiting.pop_front();
-        if next.is_none() {
-            self.running -= 1;
+    /// Unpins a finished request's blocks (tail first, so prefix blocks stay
+    /// warmest). Returns a removal event if an oversized request had pushed
+    /// the cache past capacity.
+    pub fn finish(&mut self, req: &SimRequest) -> Option<CacheEvent> {
+        for &h in req.block_hashes.iter().rev() {
+            self.cache.release(h);
         }
-        next
+        self.running -= 1;
+        self.private_blocks -= private_blocks(req);
+        self.in_flight_tokens -= req.input_tokens + req.output_tokens;
+        let evicted = self.reclaim();
+        if evicted.is_empty() {
+            return None;
+        }
+        Some(CacheEvent::BlockRemoved {
+            worker: self.id,
+            hashes: evicted,
+        })
     }
 }
 
@@ -239,20 +319,53 @@ mod tests {
             id: 0,
             arrival_ms: 0,
             input_tokens: ids.len() * BLOCK_SIZE + trailing,
-            output_tokens: 10,
+            output_tokens: 0,
             block_hashes: ids.iter().copied().map(BlockHash).collect(),
         }
     }
 
+    fn cfg(kv: usize, batch: usize) -> WorkerConfig {
+        WorkerConfig {
+            kv_capacity_blocks: kv,
+            max_batch_size: batch,
+            ..WorkerConfig::default()
+        }
+    }
+
+    /// Admits and immediately starts `r` (the worker must have room).
+    fn run(w: &mut Worker, r: &SimRequest) -> Started {
+        w.admit(0, r);
+        assert_eq!(w.pop_startable(std::slice::from_ref(r)), Some(0));
+        w.start(r, 0)
+    }
+
+    fn split(events: &[CacheEvent]) -> (Vec<u64>, Vec<u64>) {
+        let (mut removed, mut stored) = (vec![], vec![]);
+        for e in events {
+            match e {
+                CacheEvent::BlockRemoved { hashes, .. } => {
+                    removed.extend(hashes.iter().map(|h| h.0))
+                }
+                CacheEvent::BlockStored { hashes, .. } => stored.extend(hashes.iter().map(|h| h.0)),
+                CacheEvent::AllBlocksCleared { .. } => unreachable!(),
+            }
+        }
+        (removed, stored)
+    }
+
     #[test]
-    fn lru_evicts_least_recent() {
-        let mut c = LruCache::new(2);
-        c.access(BlockHash(1));
-        c.access(BlockHash(2));
-        assert_eq!(c.access(BlockHash(1)), (true, None));
-        assert_eq!(c.access(BlockHash(3)), (false, Some(BlockHash(2))));
-        assert!(c.contains(BlockHash(1)) && c.contains(BlockHash(3)));
-        assert_eq!(c.len(), 2);
+    fn pinned_blocks_are_not_evictable() {
+        let mut c = BlockCache::default();
+        assert!(!c.acquire(BlockHash(1)));
+        assert!(!c.acquire(BlockHash(2)));
+        assert_eq!(c.evict_lru(), None);
+        c.release(BlockHash(2));
+        c.release(BlockHash(1));
+        assert!(c.acquire(BlockHash(1)));
+        assert_eq!(c.pinned(), 1);
+        assert_eq!(c.evict_lru(), Some(BlockHash(2)));
+        assert_eq!(c.evict_lru(), None);
+        assert_eq!(c.snapshot(), vec![BlockHash(1)]);
     }
 
     #[test]
@@ -265,69 +378,95 @@ mod tests {
             ..WorkerConfig::default()
         };
         let mut w = Worker::new(WorkerId(0), cfg);
-        let cold = w.start(&req(&[1, 2, 3], 100), 0);
+        let mut r = req(&[1, 2, 3], 100);
+        r.output_tokens = 10;
+        let cold = run(&mut w, &r);
         assert_eq!(cold.matched_blocks, 0);
         assert_eq!(
             cold.prefill_us,
             ms_to_us(1.0 + (3.0 * 512.0 + 100.0) / 512.0)
         );
         assert_eq!(cold.decode_us, 10_000);
+        w.finish(&r);
 
         let warm = w.start(&req(&[1, 2, 9], 100), 0);
         assert_eq!(warm.matched_blocks, 2);
         assert_eq!(warm.prefill_us, ms_to_us(1.0 + 612.0 / 512.0));
+        assert_eq!(split(&warm.events), (vec![], vec![9]));
+    }
+
+    #[test]
+    fn gap_breaks_match() {
+        let mut w = Worker::new(WorkerId(0), cfg(16, 8));
+        let a = req(&[1, 2, 3], 0);
+        run(&mut w, &a);
+        w.finish(&a);
+        let s = w.start(&req(&[1, 5, 3], 0), 0);
+        assert_eq!(s.matched_blocks, 1);
         assert_eq!(
-            warm.events,
-            vec![CacheEvent::BlockStored {
-                worker: WorkerId(0),
-                hashes: vec![BlockHash(9)],
-                now_ms: 0
-            }]
+            split(&s.events),
+            (vec![], vec![5]),
+            "block 3 reuses resident storage"
         );
     }
 
     #[test]
-    fn gap_breaks_match_and_evictions_emit_net_events() {
-        let cfg = WorkerConfig {
-            kv_capacity_blocks: 3,
-            ..WorkerConfig::default()
-        };
-        let mut w = Worker::new(WorkerId(1), cfg);
-        w.start(&req(&[1, 2, 3], 0), 0);
-        assert_eq!(w.start(&req(&[1, 5, 3], 0), 0).matched_blocks, 1);
+    fn eviction_takes_lru_tail_first() {
+        let mut w = Worker::new(WorkerId(1), cfg(4, 8));
+        let a = req(&[1, 2, 3], 0);
+        run(&mut w, &a);
+        w.finish(&a); // released 3, 2, 1: block 3 is now least recent
+        let s = w.start(&req(&[7, 8], 0), 5);
+        assert_eq!(split(&s.events), (vec![3], vec![7, 8]));
+        assert_eq!(w.evictions, 1);
+        assert_eq!(w.cache().len(), 4);
+    }
 
-        // 4 fresh blocks into capacity 3: block 7 is stored then evicted by 10,
-        // so it must appear in neither event.
-        let s = w.start(&req(&[7, 8, 9, 10], 0), 5);
-        let (mut removed, mut stored): (Vec<BlockHash>, Vec<BlockHash>) = (vec![], vec![]);
-        for e in &s.events {
-            match e {
-                CacheEvent::BlockRemoved { hashes, .. } => removed.extend(hashes),
-                CacheEvent::BlockStored { hashes, .. } => stored.extend(hashes),
-                _ => unreachable!(),
-            }
-        }
-        assert!(removed.iter().all(|h| !stored.contains(h)));
-        assert_eq!(stored, vec![BlockHash(8), BlockHash(9), BlockHash(10)]);
-        assert_eq!(removed, vec![BlockHash(1), BlockHash(5), BlockHash(3)]);
-        assert_eq!(w.evictions, 5); // block 2 earlier, then 1, 5, 3, 7
+    #[test]
+    fn kv_gates_start_and_idle_worker_accepts_oversized() {
+        let mut w = Worker::new(WorkerId(0), cfg(4, 8));
+        let reqs = vec![
+            req(&[1, 2, 3], 0),
+            req(&[4, 5], 0),
+            req(&[1, 2, 3, 6, 7, 8], 0),
+        ];
+        w.admit(0, &reqs[0]);
+        w.admit(1, &reqs[1]);
+        assert_eq!(w.metrics().kv_used_blocks, 5);
+        assert_eq!(w.pop_startable(&reqs), Some(0));
+        w.start(&reqs[0], 0);
+        assert_eq!(w.pop_startable(&reqs), None, "3 pinned + 2 new > 4");
+        assert_eq!(w.metrics().queue_depth, 2);
+
+        w.finish(&reqs[0]);
+        assert_eq!(w.pop_startable(&reqs), Some(1));
+        w.start(&reqs[1], 0);
+        w.finish(&reqs[1]);
+
+        // 6 blocks into capacity 4 on an idle worker: runs, then trims on finish.
+        w.admit(2, &reqs[2]);
+        assert_eq!(w.pop_startable(&reqs), Some(2));
+        let s = w.start(&reqs[2], 0);
+        assert_eq!(w.cache().len(), 6);
+        assert_eq!(s.matched_blocks, 2, "block 3 was evicted earlier");
+        let ev = w.finish(&reqs[2]).expect("trim after oversized request");
+        assert_eq!(split(&[ev]).0.len(), 2);
+        assert_eq!(w.cache().len(), 4);
+        assert_eq!(w.metrics().kv_used_blocks, 0);
     }
 
     #[test]
     fn fifo_batch_slots() {
-        let cfg = WorkerConfig {
-            max_batch_size: 1,
-            ..WorkerConfig::default()
-        };
-        let mut w = Worker::new(WorkerId(0), cfg);
-        let r = req(&[1], 0);
-        assert!(w.admit(0, &r));
-        assert!(!w.admit(1, &r));
-        assert!(!w.admit(2, &r));
+        let mut w = Worker::new(WorkerId(0), cfg(512, 1));
+        let reqs = vec![req(&[1], 0); 3];
+        for (i, r) in reqs.iter().enumerate() {
+            w.admit(i, r);
+        }
+        assert_eq!(w.pop_startable(&reqs), Some(0));
+        w.start(&reqs[0], 0);
+        assert_eq!(w.pop_startable(&reqs), None);
         assert_eq!(w.metrics().queue_depth, 3);
-        assert_eq!(w.finish(&r), Some(1));
-        assert_eq!(w.finish(&r), Some(2));
-        assert_eq!(w.finish(&r), None);
-        assert_eq!(w.metrics().queue_depth, 0);
+        w.finish(&reqs[0]);
+        assert_eq!(w.pop_startable(&reqs), Some(1));
     }
 }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
-use kvroute_core::ScoringWeights;
+use kvroute_core::{AdmissionConfig, ScoringWeights, MAX_WORKERS};
 use kvroute_sim::engine::{self, SimConfig};
 use kvroute_sim::policy::PolicyKind;
 use kvroute_sim::worker::WorkerConfig;
@@ -19,6 +19,8 @@ enum PolicyArg {
     ApproxTtl,
     #[value(name = "kvroute")]
     KvRoute,
+    #[value(name = "kvroute-no-admission")]
+    KvRouteNoAdmission,
 }
 
 impl PolicyArg {
@@ -30,6 +32,7 @@ impl PolicyArg {
             PolicyArg::LeastLoaded => vec![PolicyKind::LeastLoaded],
             PolicyArg::ApproxTtl => vec![PolicyKind::ApproxTtl],
             PolicyArg::KvRoute => vec![PolicyKind::KvRoute],
+            PolicyArg::KvRouteNoAdmission => vec![PolicyKind::KvRouteNoAdmission],
         }
     }
 }
@@ -84,6 +87,30 @@ struct Args {
     /// Router penalty on committed KV utilization.
     #[arg(long, default_value_t = 2.0)]
     gamma: f64,
+    /// Probability each worker cache event is dropped before reaching the router.
+    #[arg(long, default_value_t = 0.0)]
+    event_drop_prob: f64,
+    /// Wipe the router's prefix index at this simulated time.
+    #[arg(long)]
+    router_restart_ms: Option<u64>,
+    /// Workers republish resident blocks this long after a router restart.
+    #[arg(long, default_value_t = 1_000)]
+    resync_delay_ms: u64,
+    /// Never resync after a restart; the index relearns from new events only.
+    #[arg(long)]
+    no_resync: bool,
+    /// KV-budget high-water mark for kvroute admission.
+    #[arg(long, default_value_t = 0.90)]
+    max_kv_util: f64,
+    /// Max outstanding requests per worker for kvroute admission (0 = unlimited).
+    #[arg(long, default_value_t = 32)]
+    max_queue_depth: usize,
+    /// Disable admission control for kvroute (kvroute-no-admission is unaffected).
+    #[arg(long)]
+    no_admission: bool,
+    /// Retry interval for requests deferred by admission control.
+    #[arg(long, default_value_t = 5)]
+    defer_backoff_ms: u64,
     /// Write per-policy summary rows to this CSV file.
     #[arg(long)]
     csv: Option<PathBuf>,
@@ -132,7 +159,28 @@ fn main() -> anyhow::Result<()> {
             beta: a.beta,
             gamma: a.gamma,
         },
+        seed: a.seed,
+        event_drop_prob: a.event_drop_prob,
+        router_restart_at_ms: a.router_restart_ms,
+        resync_delay_ms: (!a.no_resync).then_some(a.resync_delay_ms),
+        admission: (!a.no_admission).then_some(AdmissionConfig {
+            max_kv_util: a.max_kv_util,
+            max_queue_depth: (a.max_queue_depth > 0).then_some(a.max_queue_depth),
+        }),
+        defer_backoff_ms: a.defer_backoff_ms,
     };
+    anyhow::ensure!(
+        (0.0..=1.0).contains(&cfg.event_drop_prob),
+        "--event-drop-prob must be in [0, 1]"
+    );
+    anyhow::ensure!(
+        cfg.defer_backoff_ms > 0,
+        "--defer-backoff-ms must be positive"
+    );
+    anyhow::ensure!(
+        (1..=MAX_WORKERS).contains(&cfg.workers),
+        "--workers must be in 1..={MAX_WORKERS}"
+    );
     let rows: Vec<_> = a
         .policy
         .kinds()
