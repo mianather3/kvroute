@@ -114,6 +114,12 @@ struct Args {
     /// Write per-policy summary rows to this CSV file.
     #[arg(long)]
     csv: Option<PathBuf>,
+    /// Write per-policy prefix hit rate over time windows to this CSV file.
+    #[arg(long)]
+    windowed_csv: Option<PathBuf>,
+    /// Window width for --windowed-csv.
+    #[arg(long, default_value_t = 2_500)]
+    window_ms: u64,
     /// Write the synthetic workload as Mooncake JSONL (a reusable fixture).
     #[arg(long)]
     dump_trace: Option<PathBuf>,
@@ -181,16 +187,24 @@ fn main() -> anyhow::Result<()> {
         (1..=MAX_WORKERS).contains(&cfg.workers),
         "--workers must be in 1..={MAX_WORKERS}"
     );
-    let rows: Vec<_> = a
+    anyhow::ensure!(a.window_ms > 0, "--window-ms must be positive");
+    let (rows, series): (Vec<_>, Vec<_>) = a
         .policy
         .kinds()
         .into_iter()
-        .map(|k| engine::run(&cfg, k, &reqs))
-        .collect();
+        .map(|k| {
+            let (summary, records) = engine::run_detailed(&cfg, k, &reqs);
+            (summary, (k.name(), engine::windows(&records, a.window_ms)))
+        })
+        .unzip();
 
     print!("{}", engine::to_table(&rows));
     if let Some(p) = &a.csv {
         std::fs::write(p, engine::to_csv(&rows))
+            .with_context(|| format!("write {}", p.display()))?;
+    }
+    if let Some(p) = &a.windowed_csv {
+        std::fs::write(p, engine::to_windowed_csv(&series))
             .with_context(|| format!("write {}", p.display()))?;
     }
     Ok(())

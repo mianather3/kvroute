@@ -402,6 +402,71 @@ fn cells(s: &Summary) -> [String; 11] {
     ]
 }
 
+/// Prefix hit rate over fixed windows of request start time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Window {
+    pub start_ms: u64,
+    pub requests: usize,
+    pub matched_blocks: usize,
+    pub total_blocks: usize,
+}
+
+impl Window {
+    pub fn hit_rate(&self) -> f64 {
+        if self.total_blocks == 0 {
+            0.0
+        } else {
+            self.matched_blocks as f64 / self.total_blocks as f64
+        }
+    }
+}
+
+/// Buckets records by start time into contiguous `window_ms` windows,
+/// including empty ones, so time series have no gaps.
+pub fn windows(records: &[RequestRecord], window_ms: u64) -> Vec<Window> {
+    assert!(window_ms > 0, "window_ms must be positive");
+    let w_us = window_ms * 1000;
+    let n = records
+        .iter()
+        .map(|r| r.start_us / w_us + 1)
+        .max()
+        .unwrap_or(0) as usize;
+    let mut out: Vec<Window> = (0..n)
+        .map(|i| Window {
+            start_ms: i as u64 * window_ms,
+            requests: 0,
+            matched_blocks: 0,
+            total_blocks: 0,
+        })
+        .collect();
+    for r in records {
+        let w = &mut out[(r.start_us / w_us) as usize];
+        w.requests += 1;
+        w.matched_blocks += r.matched_blocks;
+        w.total_blocks += r.total_blocks;
+    }
+    out
+}
+
+pub fn to_windowed_csv(series: &[(&str, Vec<Window>)]) -> String {
+    let mut out =
+        String::from("policy,window_start_ms,requests,matched_blocks,total_blocks,hit_rate\n");
+    for (policy, ws) in series {
+        for w in ws {
+            let _ = writeln!(
+                out,
+                "{policy},{},{},{},{},{:.4}",
+                w.start_ms,
+                w.requests,
+                w.matched_blocks,
+                w.total_blocks,
+                w.hit_rate()
+            );
+        }
+    }
+    out
+}
+
 pub fn to_csv(rows: &[Summary]) -> String {
     let mut out = COLUMNS.join(",");
     out.push('\n');
@@ -513,6 +578,27 @@ mod tests {
 
         let s = run(&cfg, PolicyKind::KvRouteNoAdmission, &reqs);
         assert_eq!(s.deferrals, 0);
+    }
+
+    #[test]
+    fn windows_bucket_by_start_and_fill_gaps() {
+        let rec = |start_ms: u64, matched, total| RequestRecord {
+            id: 0,
+            arrival_ms: 0,
+            worker: WorkerId(0),
+            start_us: start_ms * 1000,
+            matched_blocks: matched,
+            total_blocks: total,
+            ttft_us: 0,
+            e2e_us: 0,
+        };
+        let ws = windows(&[rec(0, 1, 2), rec(999, 1, 2), rec(2500, 0, 4)], 1000);
+        assert_eq!(ws.len(), 3);
+        assert_eq!((ws[0].requests, ws[0].hit_rate()), (2, 0.5));
+        assert_eq!((ws[1].requests, ws[1].hit_rate()), (0, 0.0));
+        assert_eq!((ws[2].start_ms, ws[2].hit_rate()), (2000, 0.0));
+        let csv = to_windowed_csv(&[("kvroute", ws)]);
+        assert_eq!(csv.lines().nth(1), Some("kvroute,0,2,2,4,0.5000"));
     }
 
     #[test]
